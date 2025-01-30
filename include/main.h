@@ -1,6 +1,6 @@
 
-#ifndef _MAIN_H_
-#define _MAIN_H_
+#ifndef _APP_MAIN_H_
+#define _APP_MAIN_H_
 
 #include "Arduino.h"
 
@@ -15,23 +15,41 @@ typedef struct {
   unsigned int state;
   char node[5];
   char func[6];
+  char arg [128];
+  char msg [128];
+  char res [128];
   unsigned char crc;
-  char msg[255];
+  
 } Command;
 
 
-
-Command curr_command;
-
+//拆包
 bool unpack_command(Command *command);
-String pack_command(Command *command);
-uint16_t modbus_crc16(uint8_t *data, uint16_t len);
 
+//打包
+String pack_command(Command *command);
+
+//处理 GPIO 操作
 bool handle_do(Command *command);
 
+//处理 初始化硬件
+bool handle_init(Command *command);
+
+//处理 水路 操作 
+bool handle_water(Command *command);
+
+//处理 粉路 操作 
+bool handle_granule(Command *command);
+
+//喂狗
 void reload_dog(void) ;
+
+//FreeOS 看门狗线程
 void xTask_watchdog(void *xTask1);
+
+//FreeOS 命令执行线程
 void xTask_handle(void *xTask1);
+
 
 
 #endif

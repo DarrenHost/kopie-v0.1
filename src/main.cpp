@@ -1,8 +1,9 @@
 
 #include <Arduino.h>
-#include <main.h>
 #include <logger.h>
-//OneButton btnReload(36, true);
+#include <utils.h>
+#include <main.h>
+
 #define LOG_ENABLE 1
 #define USR_ENABLE 
 #define RELOAD_DOG_PIN 3
@@ -17,24 +18,30 @@
 #include <Preferences.h>
 Preferences preferences;
 
-#include <ArduinoModbus.h>
+
 
 #include <BluetoothSerial.h>
 BluetoothSerial SerialBT;
 
-
-// #include <ArduinoModbus.h>
+//主机IO口操作
+#include <ArduinoModbus.h>
 #include <USR_IO.h>
 USR_IO usr_io_instance;
 
+//当前等待执行的命令队列
 QueueHandle_t queue;
 const int queueLen = 3;
 
-
+//当前正在执行的命令
+static Command curr_command;
 
 void setup() {
 
-  preferences.begin("app", false);
+   //创建消息队列
+   queue = xQueueCreate(queueLen, sizeof(Command));
+   
+   //初始化EEMROM
+   preferences.begin("app", false);
     
    xTaskCreate(
     xTask_watchdog,   /* 任务函数 看门狗*/
@@ -44,48 +51,36 @@ void setup() {
     2,                /* 任务的优先级*/
     NULL);            /* 任务所在核心 */
    
-    //创建消息队列
-    queue = xQueueCreate(queueLen, sizeof(Command));
+    
 
     //打开串口
     Serial.begin(115200);
-    
-
     Serial1.begin(115200, SERIAL_8N1, RX1PIN, TX1PIN);
 
-   
+    //创建BT链接
     String mac = preferences.getString("MAC","EEEE");
     if(mac=="EEEE"){
-        
-        Serial.println("EEPROM");
-
-        SerialBT.begin("KP-12");
+        SerialBT.begin("KP-000000");
         mac = SerialBT.getBtAddressString(); 
         mac.replace(":","");
         preferences.putString("MAC", mac);
     }
-    
     SerialBT.begin("KP-"+mac);
-        
-    
     SerialBT.setPin("241212");
 
+    //初始化本机IO  
     usr_io_instance.init();
-    //初始化本机IO
-    delay(1000);
- 
-    //usr_io_instance.log_on(1);
-    //usr_io_instance.print();
+    delay(500);
 
     xTaskCreate(
-    xTask_handle,    /* 任务函数 处理上位机消息 */
-    "xTask_handle",  /* 名称 */
-    4096,             /* 堆栈大小. */
-    NULL,             /* 参数输入传递给任务的*/
-    2,                /* 任务的优先级*/
-    NULL); 
+      xTask_handle,    /* 任务函数 处理上位机消息 */
+      "xTask_handle",  /* 名称 */
+      4096,             /* 堆栈大小. */
+      NULL,             /* 参数输入传递给任务的*/
+      10,                /* 任务的优先级*/
+      NULL); 
 
-   
+    //初始化日志记录
     LOGGER::begin(&SerialBT);
     LOGGER::enable(true);
     LOGGER::println("Run...");
@@ -112,14 +107,11 @@ String readPacket(){
 
 void loop() {
 
-   
-   String line  = readPacket();
-   line.trim();
-   if(line.length()<1){ //空数据包，不处理
-      return;
-   }
-   
-    
+  String line  = readPacket();
+  line.trim();
+  if(line.length()<1){ //空数据包，不处理
+    return;
+  }
     //转成指令结构体
   Command cmd;
   cmd.state = COMMAND_STATE::EXECUTING;
@@ -154,32 +146,28 @@ void loop() {
 
 
 void xTask_watchdog(void *xTask1) {
-
+  pinMode(RELOAD_DOG_PIN, OUTPUT);
   while (1) {
-    reload_dog();
-    delay(200);
+
+    digitalWrite(RELOAD_DOG_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    digitalWrite(RELOAD_DOG_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(500));
+
   }
 
 }
 
-void reload_dog(void) {
-
-  pinMode(RELOAD_DOG_PIN, OUTPUT);
-  digitalWrite(RELOAD_DOG_PIN, 0);
-  delay(10);
-  digitalWrite(RELOAD_DOG_PIN, 1);
-  delay(25);
-  digitalWrite(RELOAD_DOG_PIN, 0);
-  delay(10);
-}
 
 bool unpack_command(Command *command){
   String line = String(command->msg);
   line.trim();
 
-  LOGGER::print("unpack_command:");
+  LOGGER::print("unpack:");
   LOGGER::println(line);
   
+  //获取节点名称
   String node = line.substring(0,line.indexOf('@'));
   if(node.length()>0 && node.length()<=5){
     LOGGER::print("node:");
@@ -187,6 +175,7 @@ bool unpack_command(Command *command){
     node.toCharArray(command->node, sizeof(command->node));
   }
 
+  //获取功能码
   String func = line.substring(line.indexOf('@')+1,line.indexOf('@')+6);
   if(func.length()>0 && func.length()<=6){
     LOGGER::print("func:");
@@ -194,6 +183,7 @@ bool unpack_command(Command *command){
     func.toCharArray(command->func, sizeof(command->func));
   }
 
+  //获取校验码
   String crc = line.substring(line.indexOf('&')+1,line.indexOf('&')+9);
   if(crc.length()>0 && crc.length()<=8){
     
@@ -207,25 +197,27 @@ bool unpack_command(Command *command){
     if (result == 0L || buffer[0] != '0') {
        return false;
     } 
-    //LOGGER::print("crc:");
-    //LOGGER::println(result);
+
+    LOGGER::print("crc:");
+    LOGGER::print(result);
+    LOGGER::println("");
 
   }
   
+  //计算校验码
   String str = line.substring(0,line.indexOf('&'));
   uint8_t data[str.length()];
   str.getBytes(data, sizeof(data));  
-
-  //uint8_t data[] = {0x01, 0x03, 0x00, 0x00, 0x00, 0x06};
   uint16_t len = sizeof(data) / sizeof(data[0]);
 
   // 计算Modbus CRC16
-  uint16_t modbusCRC = modbus_crc16(data, len);
+  uint16_t modbusCRC =UTILS::modbus_crc16(data, len);
   
-  Serial.print("modbusCRC:");  
-  Serial.print(str);  
-  Serial.print(","); 
-  Serial.println(modbusCRC,HEX);
+  LOGGER::print("cmp:");  
+  LOGGER::print(str);  
+  LOGGER::print(","); 
+  LOGGER::print(modbusCRC); 
+  LOGGER::println("");
 
   return line.length() >0 && line.lastIndexOf('#')>0;
 }
@@ -244,6 +236,11 @@ String pack_command(Command *command){
       break;
     default:
       line.replace("#","?"); //失败
+      String res = String(command->res);//错误码  
+      res.trim();
+      if(res.length() >0){
+          line+=res;
+      }
       break;
   }
   return line;
@@ -251,7 +248,7 @@ String pack_command(Command *command){
 
 //执行上位机消息
 void xTask_handle(void *xTask1){
-  
+
   Command cmd;
   while (1) {
     if (xQueueReceive(queue, &cmd, portMAX_DELAY)) {
@@ -259,62 +256,69 @@ void xTask_handle(void *xTask1){
       curr_command = cmd;
       curr_command.state = COMMAND_STATE::EXECUTING;
       String func = String(cmd.func);
+      bool success = false;
       if(func.startsWith("fd")){
-          handle_do(&curr_command);
+          success = handle_do(&curr_command);
       }else if(func.startsWith("f0000")){
           usr_io_instance.do_set(1,1,0); 
       }
 
-      //logln("xQueueReceive...");
-
-      //vTaskDelay(3000 / portTICK_PERIOD_MS);
-
-      curr_command.state = COMMAND_STATE::SUCCESS;
-      //SerialBT.println(cmd.msg);
-
+      if(success){
+        curr_command.state = COMMAND_STATE::SUCCESS;
+      }else{
+        curr_command.state = COMMAND_STATE::ERROR;
+      }
+      
     }
   }
 
+}
+
+void do_set(int gpio,char level){
+  if(gpio<10){
+      usr_io_instance.do_set(1,gpio, level); 
+  }else if(gpio<20){
+      usr_io_instance.do_set(2,gpio-10, level); 
+  }else if(gpio<30){
+      usr_io_instance.do_set(3,gpio-30, level); 
+  }
 }
 
 bool handle_do(Command *cmd){
   String func = String(cmd->func);
+  String msg = String(cmd->msg);
   String sub = func.substring(2,func.length());
 
   int gpio = sub.toInt();
-  LOGGER::println("sub:"+sub);
+  String t = msg.substring(msg.indexOf("t:")+2,msg.indexOf("&"));
+
+  LOGGER::println("t:"+t);
   //LOGGER::println("gpio:"+gpio);
-
-  usr_io_instance.do_set(1,gpio, 1); 
   
-  return true;
-}
 
-bool handle_io(Command *cmd){
+  unsigned long startTime = millis();
   
-  return true;
-}
+  do_set(gpio,1);
 
-// CRC16校验函数
-uint16_t modbus_crc16(uint8_t *data, uint16_t len) {
-  uint16_t crc = 0xFFFF; // 初始值
-  for (uint16_t i = 0; i < len; i++) {
-    crc ^= (uint16_t)data[i] << 8; // 将数据字节与CRC值进行XOR操作
-    for (uint8_t j = 0; j < 8; j++) {
-      if (crc & 0x8000) { // 检查最高位是否为1
-        crc = (crc << 1) ^ 0xA001; // 如果是1，进行多项式运算
-      } else {
-        crc = crc << 1; // 如果不是，则左移
-      }
-    }
+  if(t.length()>0){ // 延迟
+     float f = t.toFloat();
+     const TickType_t xFrequency = pdMS_TO_TICKS(f ); // 将 ms 转换为系统时钟节拍数
+     TickType_t xLastWakeTime = xTaskGetTickCount(); 
+     vTaskDelayUntil(&xLastWakeTime, xFrequency); 
+     do_set(gpio,0);
   }
-  return crc; // 返回最终的CRC值
+  unsigned long elapsedTime = millis() - startTime;
+  //LOGGER::println(""+elapsedTime);
+
+  return true;
 }
 
-void xTask_modbus(void *xTask1) 
-{
-  
 
-} 
 
+bool handle_granule(Command *cmd){
+  String func = String(cmd->func);
+  String sub = func.substring(2,func.length());
+
+  return true;
+}
 
