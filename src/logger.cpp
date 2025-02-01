@@ -21,7 +21,7 @@ void LOGGER::print(const String &s) {
 
 void LOGGER::print(const char &c) {
     if (_enable && _stream != nullptr) {
-        _stream->print(c);
+        _stream->print(c,HEX);
     }
 }
 
